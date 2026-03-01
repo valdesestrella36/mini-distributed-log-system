@@ -99,3 +99,22 @@ python clients/consumer/consumer.py demo --follow --offset 0
 ```
 
 
+Development timeline
+--------------------
+
+Planned milestones and notes for this repository (useful for portfolio visitors):
+
+- 2026-03-01 — v0.1.0: core MVP (protocol, append-only logs, metadata, idempotence, metrics, tests).
+- 2026-03-01 — v0.2.0: storage/durability (`MDLS_FSYNC`), log segmentation, per-segment indices and recovery scan, crash-recovery tests.
+- 2026-03-01 — v0.3.0: simple leader->follower replication and replication tests.
+
+Future work:
+
+- Add persisted indices and faster lookups
+- Improve replication (leader election, quorum, retries)
+- TLS + authentication
+- Prometheus exporter + example dashboards
+
+See `CHANGELOG.md` and `RELEASES.md` for release notes and tagging guidance.
+
+
