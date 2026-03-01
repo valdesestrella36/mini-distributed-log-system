@@ -1,0 +1,3 @@
+"""
+Keep the storage directory in the repository while keeping its contents ignored.
+"""

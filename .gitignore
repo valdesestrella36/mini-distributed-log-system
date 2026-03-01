@@ -9,9 +9,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Broker storage
-broker/storage/
+# Broker storage (ignore contents, but keep .gitkeep)
+broker/storage/*
+!broker/storage/.gitkeep
 *.db
+logs/
 
 # Editor files
 .vscode/
