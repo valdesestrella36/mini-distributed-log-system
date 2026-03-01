@@ -92,6 +92,13 @@ class Broker:
         self.segment_bytes = int(os.environ.get("MDLS_SEGMENT_BYTES", 1024 * 1024))
         # metrics
         self.metrics = Metrics()
+        # in-memory per-segment index: path -> list of byte offsets (line starts)
+        self._indices: Dict[str, List[int]] = {}
+        # build indices on startup (recovery scan)
+        try:
+            self._load_indices()
+        except Exception:
+            logger.exception("failed loading segment indices")
         # peers for simple leader->follower replication (comma-separated host:port)
         self.peers = []
         peers_env = os.environ.get("MDLS_PEERS", "").strip()
@@ -192,6 +199,49 @@ class Broker:
         files.sort(key=lambda x: x[0])
         return [p for _, p in files]
 
+    def _index_path(self, seg_path: Path) -> Path:
+        return seg_path.with_suffix(seg_path.suffix + ".idx")
+
+    def _load_index_for_segment(self, seg_path: Path) -> List[int]:
+        idx_path = self._index_path(seg_path)
+        if idx_path.exists():
+            # load existing index
+            offsets = []
+            try:
+                with idx_path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            offsets.append(int(line.strip()))
+                        except Exception:
+                            continue
+            except Exception:
+                logger.exception("failed reading index %s", idx_path)
+            return offsets
+
+        # build index by scanning the segment and write index file
+        offsets = []
+        try:
+            with seg_path.open("rb") as f:
+                pos = f.tell()
+                line = f.readline()
+                while line:
+                    offsets.append(pos)
+                    pos = f.tell()
+                    line = f.readline()
+        except Exception:
+            logger.exception("failed scanning segment %s", seg_path)
+
+        # do not persist index files here; keep indices in-memory and rebuild on startup
+        return offsets
+
+    def _load_indices(self) -> None:
+        # scan data dir for segments and load/build indices
+        for seg in sorted(self.data_dir.glob("*_*.log")):
+            try:
+                self._indices[str(seg)] = self._load_index_for_segment(seg)
+            except Exception:
+                logger.exception("error loading index for %s", seg)
+
     def _append_message(self, topic: str, partition: int, value: Any, message_id: Optional[str] = None) -> int:
         # ensure topic exists in metadata (auto-create with single partition if missing)
         if not self.meta.has_topic(topic):
@@ -225,15 +275,37 @@ class Broker:
         else:
             p = segs[-1]
 
-        with p.open("a", encoding="utf-8") as f:
-            line = json.dumps({"value": value})
-            f.write(line + "\n")
-            if self.fsync:
-                try:
-                    f.flush()
-                    os.fsync(f.fileno())
-                except Exception:
-                    logger.exception("fsync failed for %s", p)
+        # write message and record byte offset in per-segment index
+        try:
+            # open in binary to get reliable byte offsets
+            bline = (json.dumps({"value": value}) + "\n").encode("utf-8")
+            with p.open("ab") as f:
+                pos = f.tell()
+                f.write(bline)
+                if self.fsync:
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())
+                    except Exception:
+                        logger.exception("fsync failed for %s", p)
+            # update index in memory and on disk
+            seg_key = str(p)
+            offs = self._indices.get(seg_key)
+            if offs is None:
+                offs = self._load_index_for_segment(p)
+            offs.append(pos)
+            self._indices[seg_key] = offs
+        except Exception:
+            # fallback: try text append if binary fails
+            with p.open("a", encoding="utf-8") as f:
+                line = json.dumps({"value": value})
+                f.write(line + "\n")
+                if self.fsync:
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())
+                    except Exception:
+                        logger.exception("fsync failed for %s", p)
 
         # record dedup mapping if message_id provided
         if message_id is not None:
@@ -245,8 +317,20 @@ class Broker:
         # rotate segment if it grew beyond threshold
         try:
             if p.exists() and p.stat().st_size >= self.segment_bytes:
-                new_base = offset + 1
-                new_path = pdir / f"{topic}_{partition}_{new_base}.log"
+                # choose next base as max existing base + 1 for contiguous numbering
+                segs = self._segment_files(topic, partition)
+                bases = []
+                for s in segs:
+                    name = s.name
+                    if name.count("_") >= 2:
+                        try:
+                            bases.append(int(name.rsplit("_", 1)[1].split(".")[0]))
+                        except Exception:
+                            pass
+                    else:
+                        bases.append(0)
+                next_base = (max(bases) + 1) if bases else 1
+                new_path = pdir / f"{topic}_{partition}_{next_base}.log"
                 try:
                     with new_path.open("a", encoding="utf-8"):
                         pass
@@ -258,30 +342,71 @@ class Broker:
         return offset
 
     def _read_messages(self, topic: str, partition: int, offset: int, max_bytes: int) -> List[Dict[str, Any]]:
-        out = []
-        cur = 0
-        for s in self._segment_files(topic, partition):
-            if not s.exists():
-                continue
-            with s.open("r", encoding="utf-8") as f:
-                for i, line in enumerate(f):
-                    if cur + i < offset:
-                        continue
-                    try:
-                        msg = json.loads(line)
-                    except Exception:
-                        continue
-                    out.append({"offset": cur + i, "value": msg.get("value")})
-                    if sum(len(json.dumps(m)) for m in out) >= max_bytes:
-                        return out
-            # advance global counter by lines in this segment
-            try:
-                with s.open("r", encoding="utf-8") as ff:
-                    lines = sum(1 for _ in ff)
-                cur += lines
-            except Exception:
-                pass
-        return out
+        # try fast path using indices; on any inconsistency fall back to full scan
+        try:
+            out = []
+            cur = 0
+            for s in self._segment_files(topic, partition):
+                if not s.exists():
+                    continue
+                seg_key = str(s)
+                idx = self._indices.get(seg_key)
+                if idx is None:
+                    idx = self._load_index_for_segment(s)
+                    self._indices[seg_key] = idx
+
+                seg_count = len(idx)
+                if offset < cur + seg_count:
+                    # within this segment
+                    start_in_seg = offset - cur
+                    if start_in_seg < 0 or start_in_seg >= seg_count:
+                        # index inconsistency, fall back
+                        raise RuntimeError("index inconsistent")
+                    with s.open("rb") as f:
+                        f.seek(idx[start_in_seg])
+                        while True:
+                            bline = f.readline()
+                            if not bline:
+                                break
+                            try:
+                                line = bline.decode("utf-8")
+                            except Exception:
+                                continue
+                            try:
+                                msg = json.loads(line)
+                            except Exception:
+                                continue
+                            out.append({"offset": offset, "value": msg.get("value")})
+                            offset += 1
+                            if sum(len(json.dumps(m)) for m in out) >= max_bytes:
+                                return out
+                cur += seg_count
+            return out
+        except Exception:
+            # fallback: sequential scan across segments (slower but robust)
+            out = []
+            cur = 0
+            for s in self._segment_files(topic, partition):
+                if not s.exists():
+                    continue
+                with s.open("r", encoding="utf-8") as f:
+                    for i, line in enumerate(f):
+                        if cur + i < offset:
+                            continue
+                        try:
+                            msg = json.loads(line)
+                        except Exception:
+                            continue
+                        out.append({"offset": cur + i, "value": msg.get("value")})
+                        if sum(len(json.dumps(m)) for m in out) >= max_bytes:
+                            return out
+                try:
+                    with s.open("r", encoding="utf-8") as ff:
+                        lines = sum(1 for _ in ff)
+                    cur += lines
+                except Exception:
+                    pass
+            return out
 
     async def _client_handler(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         # per-connection token bucket
