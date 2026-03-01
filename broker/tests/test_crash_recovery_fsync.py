@@ -7,9 +7,12 @@ from pathlib import Path
 
 import json
 
+# ensure tests can import package from src like other tests
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from broker import pack_frame
 
 import contextlib
+import pytest
 
 
 def _read_exact(f, size):
@@ -49,9 +52,9 @@ def _wait_for_port(port, timeout=2.0):
     return False
 
 
-def test_crash_recovery_with_fsync(tmp_path):
+def test_crash_recovery_with_fsync(tmp_path, monkeypatch):
     # FSYNC enabled: messages should survive abrupt kill
-    os.environ["MDLS_FSYNC"] = "1"
+    monkeypatch.setenv("MDLS_FSYNC", "1")
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -67,10 +70,14 @@ def test_crash_recovery_with_fsync(tmp_path):
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    # Ensure subprocess can import the broker package when repo uses src layout
-    env["PYTHONPATH"] = str(Path(os.getcwd()) / "broker" / "src")
 
-    proc = subprocess.Popen([sys.executable, "-u", "-c", code, str(data_dir), str(port)], env=env)
+    # start broker subprocess; insert src path into child's sys.path to import package reliably
+    src_path = str(Path(__file__).resolve().parents[1] / "src")
+    child_code = (
+        f"import sys; sys.path.insert(0, {repr(src_path)}); "
+        + code
+    )
+    proc = subprocess.Popen([sys.executable, "-u", "-c", child_code, str(data_dir), str(port)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     s = f = s2 = f2 = None
     try:
         assert _wait_for_port(port, timeout=3.0)
@@ -96,7 +103,7 @@ def test_crash_recovery_with_fsync(tmp_path):
         proc.wait(timeout=2)
 
         # restart broker
-        proc2 = subprocess.Popen([sys.executable, "-u", "-c", code, str(data_dir), str(port)], env=env)
+        proc2 = subprocess.Popen([sys.executable, "-u", "-c", child_code, str(data_dir), str(port)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             assert _wait_for_port(port, timeout=3.0)
             s2 = socket.create_connection(("127.0.0.1", port))
