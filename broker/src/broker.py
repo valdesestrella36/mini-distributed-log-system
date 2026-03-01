@@ -86,6 +86,8 @@ class Broker:
         self.max_fetch_bytes = int(os.environ.get("MDLS_MAX_FETCH_BYTES", 65536))
         # topic name validation regex
         self._topic_re = re.compile(os.environ.get("MDLS_TOPIC_REGEX", r"^[A-Za-z0-9_.-]{1,255}$"))
+        # durability: optionally fsync after each append
+        self.fsync = os.environ.get("MDLS_FSYNC", "0") in ("1", "true", "True")
         # metrics
         self.metrics = Metrics()
         # peers for simple leader->follower replication (comma-separated host:port)
@@ -192,6 +194,13 @@ class Broker:
         with p.open("a", encoding="utf-8") as f:
             line = json.dumps({"value": value})
             f.write(line + "\n")
+            if self.fsync:
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except Exception:
+                    # if fsync fails, log but proceed (caller may choose to retry)
+                    logger.exception("fsync failed for %s", p)
         # record dedup mapping if message_id provided
         if message_id is not None:
             try:
