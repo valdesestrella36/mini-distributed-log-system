@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -81,6 +82,10 @@ class Broker:
         # pending write thresholds for pause/resume
         self.pause_threshold = int(os.environ.get("MDLS_PAUSE_THRESHOLD", 16))
         self.resume_threshold = int(os.environ.get("MDLS_RESUME_THRESHOLD", 8))
+        # configurable fetch cap to avoid unbounded memory use
+        self.max_fetch_bytes = int(os.environ.get("MDLS_MAX_FETCH_BYTES", 65536))
+        # topic name validation regex
+        self._topic_re = re.compile(os.environ.get("MDLS_TOPIC_REGEX", r"^[A-Za-z0-9_.-]{1,255}$"))
         # metrics
         self.metrics = Metrics()
         # cluster support removed in this build (single-node MVP)
@@ -186,31 +191,69 @@ class Broker:
         transport = writer.transport
         try:
             while True:
-                req = await read_frame(reader)
+                try:
+                    req = await read_frame(reader)
+                except asyncio.IncompleteReadError:
+                    # client closed connection
+                    break
+                except json.JSONDecodeError:
+                    try:
+                        writer.write(pack_frame({"status": "ERR", "code": "BAD_PAYLOAD", "message": "invalid json payload"}))
+                        await writer.drain()
+                    except Exception:
+                        pass
+                    continue
+                except Exception:
+                    # unknown read error — close connection
+                    break
 
-                # enforce PRODUCE message size limit early (if payload contains value length)
+                # validate request shape
+                if not isinstance(req, dict):
+                    try:
+                        writer.write(pack_frame({"status": "ERR", "code": "INVALID", "message": "request must be an object"}))
+                        await writer.drain()
+                    except Exception:
+                        pass
+                    continue
+
+                rerr = self._validate_request(req)
+                if rerr is not None:
+                    try:
+                        writer.write(pack_frame(rerr))
+                        await writer.drain()
+                    except Exception:
+                        pass
+                    continue
+
+                # enforce PRODUCE message size limit early
                 if req.get("type") == "PRODUCE":
                     val = req.get("value")
                     if isinstance(val, str) and len(val.encode("utf-8")) > self.max_message_bytes:
                         resp = {"status": "ERR", "code": "MSG_TOO_LARGE", "message": "message too large"}
-                        writer.write(pack_frame(resp))
-                        await writer.drain()
+                        try:
+                            writer.write(pack_frame(resp))
+                            await writer.drain()
+                        except Exception:
+                            pass
                         continue
-                    # rate limit: try consume a token, otherwise return error
                     if not token_bucket.consume(1):
                         resp = {"status": "ERR", "code": "RATE_LIMIT", "message": "rate limit exceeded"}
-                        writer.write(pack_frame(resp))
-                        await writer.drain()
+                        try:
+                            writer.write(pack_frame(resp))
+                            await writer.drain()
+                        except Exception:
+                            pass
                         continue
 
-                resp = await self.handle_request(req)  # No-op for consistency
-                # support replication RPC on followers: respond to REPLICATE requests
-                # handled inside handle_request if type == 'REPLICATE'
-                # write response and use pending counter to apply backpressure
+                resp = await self.handle_request(req)
                 pending_responses += 1
-                writer.write(pack_frame(resp))
                 try:
+                    writer.write(pack_frame(resp))
                     await writer.drain()
+                except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+                    break
+                except Exception:
+                    logger.exception("error sending response")
                 finally:
                     pending_responses -= 1
 
@@ -227,13 +270,55 @@ class Broker:
         except asyncio.IncompleteReadError:
             pass
         except Exception:
-            pass
+            logger.exception("unhandled error in client handler")
         finally:
             try:
                 writer.close()
                 await writer.wait_closed()
             except Exception:
                 pass
+
+    def _validate_request(self, req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return an error response dict if invalid, otherwise None."""
+        t = req.get("type")
+        if t not in ("PING", "METRICS", "PRODUCE", "FETCH"):
+            return {"status": "ERR", "code": "UNKNOWN", "message": "unknown request type"}
+
+        if t == "PRODUCE":
+            topic = req.get("topic")
+            if not isinstance(topic, str) or not self._topic_re.match(topic):
+                return {"status": "ERR", "code": "INVALID", "message": "invalid topic"}
+            partition = req.get("partition", 0)
+            try:
+                if int(partition) < 0:
+                    return {"status": "ERR", "code": "INVALID", "message": "invalid partition"}
+            except Exception:
+                return {"status": "ERR", "code": "INVALID", "message": "invalid partition"}
+            value = req.get("value")
+            if not (isinstance(value, str) or isinstance(value, (bytes, bytearray))):
+                return {"status": "ERR", "code": "INVALID", "message": "invalid value"}
+            message_id = req.get("message_id")
+            if message_id is not None and not isinstance(message_id, str):
+                return {"status": "ERR", "code": "INVALID", "message": "invalid message_id"}
+
+        if t == "FETCH":
+            topic = req.get("topic")
+            if not isinstance(topic, str) or not self._topic_re.match(topic):
+                return {"status": "ERR", "code": "INVALID", "message": "invalid topic"}
+            try:
+                offset = int(req.get("offset", 0))
+                if offset < 0:
+                    return {"status": "ERR", "code": "INVALID", "message": "invalid offset"}
+            except Exception:
+                return {"status": "ERR", "code": "INVALID", "message": "invalid offset"}
+            try:
+                max_bytes = int(req.get("max_bytes", 4096))
+                if max_bytes <= 0 or max_bytes > self.max_fetch_bytes:
+                    return {"status": "ERR", "code": "INVALID", "message": "max_bytes out of range"}
+            except Exception:
+                return {"status": "ERR", "code": "INVALID", "message": "invalid max_bytes"}
+
+        return None
 
     async def start(self, host: str = "127.0.0.1", port: int = 9000):
         server = await asyncio.start_server(self._client_handler, host, port)
