@@ -88,6 +88,8 @@ class Broker:
         self._topic_re = re.compile(os.environ.get("MDLS_TOPIC_REGEX", r"^[A-Za-z0-9_.-]{1,255}$"))
         # durability: optionally fsync after each append
         self.fsync = os.environ.get("MDLS_FSYNC", "0") in ("1", "true", "True")
+        # segmentation: rotate segment files when reaching this many bytes
+        self.segment_bytes = int(os.environ.get("MDLS_SEGMENT_BYTES", 1024 * 1024))
         # metrics
         self.metrics = Metrics()
         # peers for simple leader->follower replication (comma-separated host:port)
@@ -173,24 +175,56 @@ class Broker:
         fn = f"{topic}_{partition}.log"
         return self.data_dir / fn
 
+    def _segment_files(self, topic: str, partition: int) -> List[Path]:
+        """Return list of segment files for topic/partition sorted by base offset."""
+        pref = f"{topic}_{partition}"
+        files = []
+        for p in sorted(self.data_dir.glob(f"{pref}*.log")):
+            name = p.name
+            # name formats: pref.log (legacy) or pref_<base>.log
+            base = 0
+            if name.count("_") >= 2:
+                try:
+                    base = int(name.rsplit("_", 1)[1].split(".")[0])
+                except Exception:
+                    base = 0
+            files.append((base, p))
+        files.sort(key=lambda x: x[0])
+        return [p for _, p in files]
+
     def _append_message(self, topic: str, partition: int, value: Any, message_id: Optional[str] = None) -> int:
-        p = self._log_path(topic, partition)
-        p.parent.mkdir(parents=True, exist_ok=True)
         # ensure topic exists in metadata (auto-create with single partition if missing)
         if not self.meta.has_topic(topic):
             self.meta.add_topic(topic, partitions=1)
+
+        pdir = self.data_dir
+        pdir.mkdir(parents=True, exist_ok=True)
 
         # dedup: if message_id provided and already present, return existing offset
         if message_id is not None:
             existing = self.meta.lookup_message_id(topic, partition, message_id)
             if existing is not None:
                 return existing
-        # simple offset = number of lines before append
+
+        # compute global offset as total lines across all segments
         offset = 0
-        if p.exists():
-            with p.open("r", encoding="utf-8") as f:
-                for _ in f:
-                    offset += 1
+        for s in self._segment_files(topic, partition):
+            if s.exists():
+                try:
+                    with s.open("r", encoding="utf-8") as f:
+                        for _ in f:
+                            offset += 1
+                except Exception:
+                    pass
+
+        # choose current segment
+        segs = self._segment_files(topic, partition)
+        if not segs:
+            # create legacy single-file name for first segment for backwards compatibility
+            p = pdir / f"{topic}_{partition}.log"
+        else:
+            p = segs[-1]
+
         with p.open("a", encoding="utf-8") as f:
             line = json.dumps({"value": value})
             f.write(line + "\n")
@@ -199,33 +233,54 @@ class Broker:
                     f.flush()
                     os.fsync(f.fileno())
                 except Exception:
-                    # if fsync fails, log but proceed (caller may choose to retry)
                     logger.exception("fsync failed for %s", p)
+
         # record dedup mapping if message_id provided
         if message_id is not None:
             try:
                 self.meta.add_message_id(topic, partition, message_id, offset)
             except Exception:
                 pass
+
+        # rotate segment if it grew beyond threshold
+        try:
+            if p.exists() and p.stat().st_size >= self.segment_bytes:
+                new_base = offset + 1
+                new_path = pdir / f"{topic}_{partition}_{new_base}.log"
+                try:
+                    with new_path.open("a", encoding="utf-8"):
+                        pass
+                except Exception:
+                    logger.exception("failed creating new segment %s", new_path)
+        except Exception:
+            logger.exception("error checking segment rotation for %s", p)
+
         return offset
 
     def _read_messages(self, topic: str, partition: int, offset: int, max_bytes: int) -> List[Dict[str, Any]]:
-        p = self._log_path(topic, partition)
-        if not p.exists():
-            return []
         out = []
-        with p.open("r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i < offset:
-                    continue
-                try:
-                    msg = json.loads(line)
-                except Exception:
-                    continue
-                out.append({"offset": i, "value": msg.get("value")})
-                # approximate size check
-                if sum(len(json.dumps(m)) for m in out) >= max_bytes:
-                    break
+        cur = 0
+        for s in self._segment_files(topic, partition):
+            if not s.exists():
+                continue
+            with s.open("r", encoding="utf-8") as f:
+                for i, line in enumerate(f):
+                    if cur + i < offset:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except Exception:
+                        continue
+                    out.append({"offset": cur + i, "value": msg.get("value")})
+                    if sum(len(json.dumps(m)) for m in out) >= max_bytes:
+                        return out
+            # advance global counter by lines in this segment
+            try:
+                with s.open("r", encoding="utf-8") as ff:
+                    lines = sum(1 for _ in ff)
+                cur += lines
+            except Exception:
+                pass
         return out
 
     async def _client_handler(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
