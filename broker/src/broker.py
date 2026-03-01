@@ -11,24 +11,34 @@ try:
 except Exception:
     from metrics import Metrics
 
-# Configure structured JSON logging for the broker
+# Configure logging; allow JSON or plain text via env
 logger = logging.getLogger("mini_distributed_log.broker")
 if not logger.handlers:
     h = logging.StreamHandler()
-    fmt = lambda record: json.dumps({
-        "ts": time.time(),
-        "level": record.levelname,
-        "module": record.name,
-        "msg": record.getMessage(),
-        **(getattr(record, "extra", {}) if hasattr(record, "extra") else {}),
-    })
-    class JsonFormatter(logging.Formatter):
-        def format(self, record):
-            return fmt(record)
+    log_json = os.environ.get("MDLS_LOG_JSON", "0") in ("1", "true", "True")
+    level_name = os.environ.get("MDLS_LOG_LEVEL", "INFO")
+    try:
+        logger.setLevel(getattr(logging, level_name.upper()))
+    except Exception:
+        logger.setLevel(logging.INFO)
 
-    h.setFormatter(JsonFormatter())
+    if log_json:
+        fmt = lambda record: json.dumps({
+            "ts": time.time(),
+            "level": record.levelname,
+            "module": record.name,
+            "msg": record.getMessage(),
+            **(getattr(record, "extra", {}) if hasattr(record, "extra") else {}),
+        })
+        class JsonFormatter(logging.Formatter):
+            def format(self, record):
+                return fmt(record)
+
+        h.setFormatter(JsonFormatter())
+    else:
+        h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s"))
+
     logger.addHandler(h)
-    logger.setLevel(logging.INFO)
 try:
     from .metadata import Metadata
 except Exception:
