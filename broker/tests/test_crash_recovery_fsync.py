@@ -9,13 +9,23 @@ import json
 
 from broker import pack_frame
 
+import contextlib
+
+
+def _read_exact(f, size):
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = f.read(size - len(buf))
+        if not chunk:
+            raise EOFError("unexpected EOF while reading frame")
+        buf.extend(chunk)
+    return bytes(buf)
+
 
 def read_frame_sync(f):
-    hdr = f.read(4)
-    if not hdr:
-        raise EOFError("no header")
+    hdr = _read_exact(f, 4)
     size = int.from_bytes(hdr, "big")
-    payload = f.read(size)
+    payload = _read_exact(f, size)
     return json.loads(payload.decode("utf-8"))
 
 
@@ -61,19 +71,17 @@ def test_crash_recovery_with_fsync(tmp_path):
     env["PYTHONPATH"] = str(Path(os.getcwd()) / "broker" / "src")
 
     proc = subprocess.Popen([sys.executable, "-u", "-c", code, str(data_dir), str(port)], env=env)
+    s = f = s2 = f2 = None
     try:
         assert _wait_for_port(port, timeout=3.0)
 
         # produce messages
-        reader = None
-        writer = None
         try:
-            reader, writer = socket.create_connection(("127.0.0.1", port)), None
+            # use low-level socket with pack_frame/read_frame helpers
+            s = socket.create_connection(("127.0.0.1", port))
+            f = s.makefile('rwb')
         except Exception:
-            pass
-        # use low-level socket with pack_frame/read_frame helpers
-        s = socket.create_connection(("127.0.0.1", port))
-        f = s.makefile('rwb')
+            raise
         n = 20
         for i in range(n):
             req = {"type": "PRODUCE", "topic": "crash-topic", "value": f"m{i}", "partition": 0}
@@ -104,9 +112,24 @@ def test_crash_recovery_with_fsync(tmp_path):
             for i in range(n):
                 assert f"m{i}" in vals
         finally:
-            proc2.kill()
-            proc2.wait(timeout=2)
+            try:
+                proc2.kill()
+            except Exception:
+                pass
+            try:
+                proc2.wait(timeout=2)
+            except Exception:
+                pass
     finally:
+        # ensure sockets / file objects are closed and process cleaned up
+        for obj in (f2, s2, f, s):
+            if obj is None:
+                continue
+            with contextlib.suppress(Exception):
+                try:
+                    obj.close()
+                except Exception:
+                    pass
         try:
             proc.kill()
         except Exception:
