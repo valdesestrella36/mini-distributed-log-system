@@ -9,8 +9,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# SQLite database
-broker/data/
+# Broker storage
+broker/storage/
 *.db
 
 # Editor files
