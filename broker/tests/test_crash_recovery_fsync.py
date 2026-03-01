@@ -57,6 +57,8 @@ def test_crash_recovery_with_fsync(tmp_path):
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    # Ensure subprocess can import the broker package when repo uses src layout
+    env["PYTHONPATH"] = str(Path(os.getcwd()) / "broker" / "src")
 
     proc = subprocess.Popen([sys.executable, "-u", "-c", code, str(data_dir), str(port)], env=env)
     try:
