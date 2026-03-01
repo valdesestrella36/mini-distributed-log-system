@@ -3,7 +3,12 @@
 This project follows a simple, human-driven release process for portfolio/demo purposes.
 
 Suggested tags for public snapshots and portfolio releases:
-- `v1.0.0` — polished snapshot: durability, segmentation, indices, replication, tests, docs
+
+Historic tags (previous internal snapshots):
+
+- `v0.1.0` — initial MVP (protocol, append-only logs, metadata, idempotence, metrics)
+- `v0.2.0` — storage/durability and segmentation improvements
+- `v0.3.0` — simple replication and replication tests
 
 How to create a release locally and push a tag (example for `v1.0.0`):
 
