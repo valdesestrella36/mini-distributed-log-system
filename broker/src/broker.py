@@ -88,6 +88,20 @@ class Broker:
         self._topic_re = re.compile(os.environ.get("MDLS_TOPIC_REGEX", r"^[A-Za-z0-9_.-]{1,255}$"))
         # metrics
         self.metrics = Metrics()
+        # peers for simple leader->follower replication (comma-separated host:port)
+        self.peers = []
+        peers_env = os.environ.get("MDLS_PEERS", "").strip()
+        if peers_env:
+            for p in peers_env.split(","):
+                p = p.strip()
+                if not p:
+                    continue
+                if ":" in p:
+                    host, sport = p.rsplit(":", 1)
+                    try:
+                        self.peers.append((host, int(sport)))
+                    except Exception:
+                        logger.warning("invalid peer entry '%s'", p)
         # cluster support removed in this build (single-node MVP)
 
     async def handle_request(self, req: Dict[str, Any]) -> Dict[str, Any]:
@@ -102,6 +116,21 @@ class Broker:
 
     # replication helpers removed (single-node)
 
+        if t == "REPLICATE":
+            topic = req.get("topic")
+            partition = int(req.get("partition", 0))
+            value = req.get("value")
+            message_id = req.get("message_id")
+            if topic is None or value is None:
+                return {"status": "ERR", "code": "INVALID", "message": "topic/value required"}
+            start = time.monotonic()
+            offset = await asyncio.to_thread(self._append_message, topic, partition, value, message_id)
+            elapsed_ms = (time.monotonic() - start) * 1000.0
+            self.metrics.incr("messages_replicated", 1)
+            self.metrics.record_latency("replicate", elapsed_ms)
+            logger.info("replicate", extra={"topic": topic, "partition": partition, "offset": offset, "message_id": message_id})
+            return {"status": "OK", "offset": offset}
+
         if t == "PRODUCE":
             topic = req.get("topic")
             partition = int(req.get("partition", 0))
@@ -115,6 +144,12 @@ class Broker:
             self.metrics.incr("messages_produced", 1)
             self.metrics.record_latency("produce", elapsed_ms)
             logger.info("produce", extra={"topic": topic, "partition": partition, "offset": offset, "message_id": message_id, "latency_ms": elapsed_ms})
+            # replicate asynchronously to peers
+            if self.peers:
+                try:
+                    asyncio.create_task(self._replicate_to_peers(topic, partition, value, message_id))
+                except Exception:
+                    logger.exception("failed scheduling replication tasks")
             return {"status": "OK", "offset": offset}
 
         if t == "FETCH":
@@ -281,7 +316,7 @@ class Broker:
     def _validate_request(self, req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Return an error response dict if invalid, otherwise None."""
         t = req.get("type")
-        if t not in ("PING", "METRICS", "PRODUCE", "FETCH"):
+        if t not in ("PING", "METRICS", "PRODUCE", "FETCH", "REPLICATE"):
             return {"status": "ERR", "code": "UNKNOWN", "message": "unknown request type"}
 
         if t == "PRODUCE":
@@ -326,6 +361,33 @@ class Broker:
         print(f"Broker listening on {addrs}")
         async with server:
             await server.serve_forever()
+
+    async def _send_replicate(self, host: str, port: int, topic: str, partition: int, value: Any, message_id: Optional[str]):
+        try:
+            reader, writer = await asyncio.open_connection(host, port)
+            req = {"type": "REPLICATE", "topic": topic, "partition": partition, "value": value}
+            if message_id is not None:
+                req["message_id"] = message_id
+            writer.write(pack_frame(req))
+            await writer.drain()
+            try:
+                await read_frame(reader)
+            except Exception:
+                pass
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("replicate to %s:%s failed", host, port)
+
+    async def _replicate_to_peers(self, topic: str, partition: int, value: Any, message_id: Optional[str]):
+        for host, port in self.peers:
+            try:
+                asyncio.create_task(self._send_replicate(host, port, topic, partition, value, message_id))
+            except Exception:
+                logger.exception("scheduling replicate task failed for %s:%s", host, port)
 
 
 class _TokenBucket:
